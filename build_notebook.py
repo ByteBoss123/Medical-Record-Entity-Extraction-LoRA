@@ -256,11 +256,13 @@ code("!apt-get -qq install -y tesseract-ocr > /dev/null 2>&1; pip -q install pyt
 code("%%writefile ocr.py\n" + (HERE / "ocr.py").read_text())
 
 code(r'''
-import ocr, multiprocessing as mp, importlib; importlib.reload(ocr)
+import ocr, importlib; importlib.reload(ocr)
+from multiprocessing.pool import ThreadPool  # threads, not fork: forking a CUDA/torch process can deadlock; tesseract runs as a subprocess anyway
+os.environ["OMP_THREAD_LIMIT"] = "1"  # one OpenMP thread per tesseract call
 os.makedirs("results/ocr_samples", exist_ok=True)
 jobs = [((c.doc_id, c.idx), c.text, lv, i) for i, c in enumerate(test) for lv in ocr.LEVELS]
 t0 = time.time()
-with mp.Pool(4) as pool: outs = pool.map(ocr.ocr_job, jobs, chunksize=8)
+with ThreadPool(4) as pool: outs = pool.map(ocr.ocr_job, jobs, chunksize=8)
 print(f"OCR {len(jobs)} pages in {(time.time()-t0)/60:.1f} min")
 for lv in ocr.LEVELS: ocr.render(test[0].text, lv, 0).save(f"results/ocr_samples/{test[0].doc_id}_{lv}.jpg")
 OCR = {lv: {} for lv in ocr.LEVELS}; CER = {lv: [] for lv in ocr.LEVELS}
