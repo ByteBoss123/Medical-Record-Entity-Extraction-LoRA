@@ -15,7 +15,7 @@ with manual expert annotations. Task: pull the facts a personal-injury medical c
 
 **Pre-registered setup (fixed before seeing test results):** document-level 70/10/20 split (seed 13);
 3-sentence chunks; strict + relaxed set-based F1 per chunk; paired document-level bootstrap (2,000 resamples).
-Run on **Kaggle, GPU T4 x2 (one GPU used), Internet ON**. Runtime ≈ 1.5–2 h.
+Run on **Kaggle, GPU T4 x2 (one GPU used), Internet ON**. Runtime ≈ 2–2.5 h.
 """)
 
 code("""
@@ -155,7 +155,7 @@ bert.load_state_dict(best_state)
 t1 = time.time(); pb = bert_predict(bert, test); lat = (time.time() - t1) / len(test)
 record("biobert", pb, {"best_epoch": best_ep, "val_curve": curve, "train_minutes": (t1 - t0) / 60,
                        "sec_per_chunk": lat})
-del bert; torch.cuda.empty_cache()
+# keep `bert` loaded: reused in the OCR robustness cell
 ''')
 
 code(r'''
@@ -244,6 +244,48 @@ json.dump({f"{k[0]}#{k[1]}": v for k, v in raw.items()}, open("results/raw_qwen1
 model.save_pretrained("results/lora_adapter")
 ''')
 
+md("""
+## OCR robustness (simulated scans)
+Real medical records often arrive as scans. Each test chunk is rendered as a page image at three pre-set
+degradation levels (blur, speckle noise, skew, JPEG, downscale), OCR'd with Tesseract, and re-scored against
+the **original** gold annotations. Degradation is synthetic, applied to real text; these are not real scans.
+""")
+
+code("!apt-get -qq install -y tesseract-ocr > /dev/null 2>&1; pip -q install pytesseract; tesseract --version | head -1")
+code("%%writefile ocr.py\n" + (HERE / "ocr.py").read_text())
+
+code(r'''
+import ocr, multiprocessing as mp, importlib; importlib.reload(ocr)
+os.makedirs("results/ocr_samples", exist_ok=True)
+jobs = [((c.doc_id, c.idx), c.text, lv, i) for i, c in enumerate(test) for lv in ocr.LEVELS]
+t0 = time.time()
+with mp.Pool(4) as pool: outs = pool.map(ocr.ocr_job, jobs, chunksize=8)
+print(f"OCR {len(jobs)} pages in {(time.time()-t0)/60:.1f} min")
+for lv in ocr.LEVELS: ocr.render(test[0].text, lv, 0).save(f"results/ocr_samples/{test[0].doc_id}_{lv}.jpg")
+OCR = {lv: {} for lv in ocr.LEVELS}; CER = {lv: [] for lv in ocr.LEVELS}
+for k, lv, txt, c in outs: OCR[lv][k] = txt; CER[lv].append(c)
+OCR_RESULTS = {}; OCR_PRED = {}
+for lv in ocr.LEVELS:
+    och = [mre.Chunk(c.doc_id, c.idx, c.start, c.end, OCR[lv][(c.doc_id, c.idx)], c.spans) for c in test]
+    preds = {"lexicon": {(c.doc_id, c.idx): mre.lexicon_predict(c, lex) for c in och}}
+    pc = {}
+    for c in och:
+        toks = mre.tokenize(c.text); pc[(c.doc_id, c.idx)] = mre.tags_to_set(c.text, toks, crf.predict_single(mre.crf_features(toks)))
+    preds["crf"] = pc
+    preds["biobert"] = bert_predict(bert, och)
+    s_, r_, _, ex_ = generate(model, och); preds["qwen1.5b_lora"] = s_
+    OCR_PRED[lv] = preds
+    OCR_RESULTS[lv] = {"mean_cer": float(np.mean(CER[lv])), "median_cer": float(np.median(CER[lv])),
+                       "lora_json_valid_rate": ex_["json_valid_rate"],
+                       "systems": {n_: {m: mre.score(test, p_, relaxed=(m == "relaxed"))["micro_f1"]
+                                        for m in ("strict", "relaxed")} for n_, p_ in preds.items()}}
+    print(lv, f"CER {OCR_RESULTS[lv]['mean_cer']:.3f}",
+          {n_: round(v["strict"], 3) for n_, v in OCR_RESULTS[lv]["systems"].items()})
+OCR_BOOT = {f"{n_}_{lv}_minus_original": mre.paired_bootstrap(test, OCR_PRED[lv][n_], PRED[n_])
+            for lv in ("mild", "heavy") for n_ in ("biobert", "qwen1.5b_lora")}
+print(json.dumps({k: [round(v["diff"], 4), [round(x, 4) for x in v["ci95"]]] for k, v in OCR_BOOT.items()}, indent=1))
+''')
+
 code(r'''
 # ---- Paired bootstrap, tables, save everything ----
 import pandas as pd
@@ -265,7 +307,8 @@ per = pd.DataFrame([{"system": n_, "type": t, **{f"strict_{k}": round(v, 4) if i
 per.to_csv("results/per_type.csv", index=False)
 env = {"torch": torch.__version__, "transformers": transformers.__version__, "peft": peft.__version__,
        "gpu": torch.cuda.get_device_name(0)}
-json.dump({"data": stats, "results": RESULTS, "bootstrap": boot, "env": env},
+json.dump({"data": stats, "results": RESULTS, "bootstrap": boot, "ocr": OCR_RESULTS,
+           "ocr_bootstrap": OCR_BOOT, "env": env},
           open("results/metrics.json", "w"), indent=1, default=float)
 display(summary)
 print(json.dumps({k: {m: {"diff": round(v[m]["diff"], 4), "ci95": [round(x, 4) for x in v[m]["ci95"]]}

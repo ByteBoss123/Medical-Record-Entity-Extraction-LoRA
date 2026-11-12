@@ -93,3 +93,10 @@ def test_bootstrap(tmp_path):
     gold = {(c.doc_id, c.idx): mre.gold_set(c) for c in ch}
     r = mre.paired_bootstrap(ch, gold, {}, n=200)
     assert r["diff"] == 1.0 and r["ci95"][0] == 1.0
+
+
+def test_ocr_roundtrip():
+    import ocr
+    assert ocr.cer("abc def", "abc  def") == 0.0 and ocr.cer("abcd", "abxd") == 0.25
+    _, lv, out, c = ocr.ocr_job((0, TEXT, "clean", 0))
+    assert lv == "clean" and c < 0.02 and "cervical spine" in out

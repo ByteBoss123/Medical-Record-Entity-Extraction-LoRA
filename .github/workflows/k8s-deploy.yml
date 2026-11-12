@@ -1,0 +1,74 @@
+name: k8s-deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+jobs:
+  test-train-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Unit tests
+        run: |
+          sudo apt-get -qq install -y tesseract-ocr
+          pip install -q pytest numpy pillow pytesseract -r serve/requirements.txt httpx
+          pytest -q tests
+      - name: Train CRF on real MACCROBAT (figshare)
+        run: python serve/train_crf.py
+      - name: Build image
+        run: docker build -t medrec-extract:ci .
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with: {cluster_name: ci}
+      - name: Deploy
+        run: |
+          kind load docker-image medrec-extract:ci --name ci
+          kubectl apply -f k8s/deployment.yaml
+          kubectl rollout status deployment/medrec-extract --timeout=180s
+          kubectl get pods -o wide
+      - name: Smoke test through the Service
+        run: |
+          kubectl port-forward svc/medrec-extract 8080:80 > pf.log 2>&1 &
+          sleep 5
+          curl -sf localhost:8080/health | tee health.json
+          python - <<'PY'
+          import json, glob, urllib.request
+          txt = open(sorted(glob.glob("data/**/*.txt", recursive=True))[0]).read()[:3000]
+          req = urllib.request.Request("http://localhost:8080/extract",
+                data=json.dumps({"text": txt}).encode(), headers={"Content-Type": "application/json"})
+          r = json.load(urllib.request.urlopen(req))
+          assert r["entities"], "no entities returned"
+          assert all(txt[e["start"]:e["end"]] == e["text"] for e in r["entities"]), "offset mismatch"
+          print(len(r["entities"]), "entities;", r["latency_ms"], "ms")
+          json.dump(r, open("extract_sample.json", "w"), indent=1)
+          PY
+      - name: Load test (500 requests)
+        run: |
+          pkill -f "port-forward" || true
+          kubectl port-forward svc/medrec-extract 8080:80 > pf2.log 2>&1 &
+          sleep 5
+          python - <<'PY'
+          import json, glob, time, urllib.request, statistics
+          txt = open(sorted(glob.glob("data/**/*.txt", recursive=True))[1]).read()[:2000]
+          body = json.dumps({"text": txt}).encode(); lat = []; ok = 0
+          for _ in range(500):
+              t = time.perf_counter()
+              r = urllib.request.urlopen(urllib.request.Request("http://localhost:8080/extract", data=body,
+                    headers={"Content-Type": "application/json"}))
+              ok += r.status == 200; lat.append((time.perf_counter() - t) * 1000)
+          lat.sort()
+          out = {"requests": 500, "success": ok, "p50_ms": lat[249], "p95_ms": lat[474], "p99_ms": lat[494]}
+          print(out); json.dump(out, open("load_test.json", "w"), indent=1)
+          PY
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k8s-run
+          path: |
+            serve/model/train_meta.json
+            health.json
+            extract_sample.json
+            load_test.json
