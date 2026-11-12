@@ -19,6 +19,7 @@ Run on **Kaggle, GPU T4 x2 (one GPU used), Internet ON**. Runtime ≈ 2–2.5 h.
 """)
 
 code("""
+!pip -q uninstall -y torchao  # Kaggle ships torchao 0.10; current peft rejects <0.16 and we do not use it
 !pip -q install -U peft sklearn-crfsuite
 import torch, transformers, peft, sys, platform
 print(torch.__version__, transformers.__version__, peft.__version__, platform.python_version())
