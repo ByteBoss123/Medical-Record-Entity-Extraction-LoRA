@@ -53,4 +53,12 @@ Local tests (CPU, format fixture only): `pytest tests`.
 Local service: `python serve/train_crf.py && uvicorn serve.app:app`.
 
 ## Results
+### Verified in CI (GitHub Actions run 43301762015, Nov 12 2026)
+- Data: MACCROBAT2020, 200 documents; split 140 / 20 / 40 (train / val / test documents).
+- CRF baseline on the 40 test documents: strict micro-F1 0.575, macro-F1 0.537 (8 entity types).
+- Kubernetes (kind, 2 replicas, readiness/liveness probes): rollout succeeded; 500/500 `/extract` requests
+  returned 200 through the Service; latency p50 11.8 ms, p95 46.7 ms, p99 48.6 ms
+  (CI runner via `kubectl port-forward`, ~2,000-character inputs; not a production benchmark).
+
+### LLM / BioBERT / OCR comparison
 Pending the Kaggle run.
