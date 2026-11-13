@@ -1,0 +1,32 @@
+name: spacy-only
+on:
+  push:
+    branches: [main]
+    paths: [".github/workflows/spacy-only.yml"]
+  workflow_dispatch:
+jobs:
+  spacy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    env:
+      WANDB_API_KEY: ${{ secrets.WANDB_API_KEY }}
+      WANDB_SILENT: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.11"}
+      - name: Install
+        run: |
+          true
+          pip install -q "transformers>=4.44" sentencepiece spacy wandb numpy -r serve/requirements.txt
+      - name: Train CRF and download MACCROBAT (figshare)
+        run: python serve/train_crf.py
+      - name: spaCy NER + FLAN-T5 seq2seq on the same split
+        run: python experiments/cpu_models.py --skip-seq2seq --data "$(python -c "import glob,os;print(sorted({os.path.dirname(p) for p in glob.glob('data/**/*.ann',recursive=True) if '2020' in p})[0])")"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spacy-only
+          path: |
+            results_cpu/
+            wandb/
