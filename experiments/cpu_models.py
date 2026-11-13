@@ -130,7 +130,8 @@ def run_seq2seq(CH, epochs, log, model_name="google/flan-t5-small", smoke=False)
     random.seed(0)
     torch.set_num_threads(os.cpu_count() or 2)
     tok = AutoTokenizer.from_pretrained(model_name)
-    model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name).to(dev)
     prefix = "Extract medical entities (type: exact text): "
     train = CH["train"][:40] if smoke else CH["train"]
     src = [prefix + c.text for c in train]
@@ -149,7 +150,7 @@ def run_seq2seq(CH, epochs, log, model_name="google/flan-t5-small", smoke=False)
             enc = tok([src[j] for j in b], max_length=512, truncation=True, padding=True, return_tensors="pt")
             lab = tok([tgt[j] for j in b], max_length=max_tgt, truncation=True, padding=True, return_tensors="pt")["input_ids"]
             lab[lab == tok.pad_token_id] = -100
-            loss = model(**enc, labels=lab).loss
+            loss = model(**{k: v.to(dev) for k, v in enc.items()}, labels=lab.to(dev)).loss
             loss.backward()
             opt.step()
             opt.zero_grad()
@@ -162,23 +163,23 @@ def run_seq2seq(CH, epochs, log, model_name="google/flan-t5-small", smoke=False)
     model.eval()
     vchunks = CH["val"][:20] if smoke else CH["val"]
     tchunks = CH["test"][:20] if smoke else CH["test"]
-    vp, _ = s2s_predict(model, tok, vchunks, prefix, max_tgt)
+    vp, _ = s2s_predict(model, tok, vchunks, prefix, max_tgt, dev)
     t1 = time.time()
-    tp, raw = s2s_predict(model, tok, tchunks, prefix, max_tgt)
+    tp, raw = s2s_predict(model, tok, tchunks, prefix, max_tgt, dev)
     return tp, raw, {"model": model_name, "epochs": epochs, "lr": 5e-4, "batch_size": bs,
                      "epoch_train_loss": curve, "train_minutes": train_min,
                      "val_strict_micro_f1": mre.score(vchunks, vp)["micro_f1"],
-                     "sec_per_chunk": (time.time() - t1) / len(tchunks), "max_target_tokens": max_tgt}, tchunks
+                     "sec_per_chunk": (time.time() - t1) / len(tchunks), "max_target_tokens": max_tgt, "device": dev}, tchunks
 
 
-def s2s_predict(model, tok, chunks, prefix, max_tgt, bs=16):
+def s2s_predict(model, tok, chunks, prefix, max_tgt, dev="cpu", bs=16):
     import torch
     out, raw = {}, {}
     for i in range(0, len(chunks), bs):
         b = chunks[i:i + bs]
         enc = tok([prefix + c.text for c in b], max_length=512, truncation=True, padding=True, return_tensors="pt")
         with torch.no_grad():
-            g = model.generate(**enc, max_new_tokens=max_tgt, num_beams=1)
+            g = model.generate(**{k: v.to(dev) for k, v in enc.items()}, max_new_tokens=max_tgt, num_beams=1)
         for c, s in zip(b, tok.batch_decode(g, skip_special_tokens=True)):
             out[(c.doc_id, c.idx)] = parse_linear(s)
             raw[(c.doc_id, c.idx)] = s
@@ -191,6 +192,7 @@ def main():
     ap.add_argument("--data")
     ap.add_argument("--smoke", action="store_true")
     ap.add_argument("--skip-seq2seq", action="store_true")
+    ap.add_argument("--skip-spacy", action="store_true")
     ap.add_argument("--out", default="results_cpu")
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
@@ -214,12 +216,15 @@ def main():
 
     res = {"data": {"n_docs": n_docs, "source_dirs": dirs,
                     "split_chunks": {k: len(v) for k, v in CH.items()}}, "wandb_mode": mode}
-    sp_preds, sp_extra = run_spacy(CH, 3 if a.smoke else 30, log)
-    res["spacy_ner"] = {"strict": mre.score(test, sp_preds), "relaxed": mre.score(test, sp_preds, relaxed=True), **sp_extra}
+    sp_preds = None
+    if not a.skip_spacy:
+      sp_preds, sp_extra = run_spacy(CH, 3 if a.smoke else 30, log)
+      res["spacy_ner"] = {"strict": mre.score(test, sp_preds), "relaxed": mre.score(test, sp_preds, relaxed=True), **sp_extra}
+      print("spaCy strict micro-F1", round(res["spacy_ner"]["strict"]["micro_f1"], 4), flush=True)
     if crf_preds:
         res["crf"] = {"strict": mre.score(test, crf_preds)}
-        res["bootstrap_spacy_minus_crf"] = mre.paired_bootstrap(test, sp_preds, crf_preds)
-    print("spaCy strict micro-F1", round(res["spacy_ner"]["strict"]["micro_f1"], 4), flush=True)
+        if sp_preds is not None:
+            res["bootstrap_spacy_minus_crf"] = mre.paired_bootstrap(test, sp_preds, crf_preds)
 
     if not a.skip_seq2seq:
         s2, raw, s2_extra, tch = run_seq2seq(CH, 1 if a.smoke else 15, log, smoke=a.smoke)
@@ -227,8 +232,10 @@ def main():
                                         "n_test_chunks": len(tch), **s2_extra}
         res["flan_t5_small_seq2seq"]["hallucination_rate"] = mre.hallucination_rate(
             tch, {k: [(t, x) for t, x in v] for k, v in s2.items()})
-        if not a.smoke:
+        if not a.smoke and sp_preds is not None:
             res["bootstrap_seq2seq_minus_spacy"] = mre.paired_bootstrap(test, s2, sp_preds)
+        if not a.smoke and crf_preds:
+            res["bootstrap_seq2seq_minus_crf"] = mre.paired_bootstrap(test, s2, crf_preds)
         json.dump({f"{k[0]}#{k[1]}": v for k, v in raw.items()}, open(f"{a.out}/raw_seq2seq.json", "w"))
         print("seq2seq strict micro-F1", round(res["flan_t5_small_seq2seq"]["strict"]["micro_f1"], 4), flush=True)
 
