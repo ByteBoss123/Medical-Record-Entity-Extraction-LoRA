@@ -79,6 +79,15 @@ Paired document-level bootstrap (2,000 resamples), strict micro-F1 difference [9
 - BioBERT minus CRF: +0.081 [0.054, 0.106]
 - CRF minus lexicon: +0.160 [0.137, 0.185]
 
+### More baselines on the same split (`experiments/cpu_models.py`, Nov 13 2026)
+| System | Strict micro-F1 | Run |
+|---|---|---|
+| spaCy NER (blank `en`, 30 epochs, best epoch on val) | 0.550 | GitHub Actions `spacy-only`, CPU |
+| FLAN-T5-small seq2seq (15 epochs, linearized `type: text` targets) | 0.597 | Kaggle T4 (`seq2seq_gpu.ipynb`) |
+
+Paired bootstrap vs the CRF (0.575): spaCy -0.025 [-0.040, -0.011]; FLAN-T5 +0.021 [+0.005, +0.036].
+Both runs are logged with Weights & Biases (offline mode unless `WANDB_API_KEY` is set).
+
 ### OCR robustness (simulated scans, same 40 test reports)
 | Level | Mean CER | lexicon | crf | biobert | qwen1.5b_lora |
 |---|---|---|---|---|---|
